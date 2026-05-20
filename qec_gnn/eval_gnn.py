@@ -19,7 +19,14 @@ def _scalar(value: Any) -> Any:
     return array.item() if array.shape == () else array.tolist()
 
 
-def evaluate_gnn(model_path: Path, data_path: Path, metrics_path: Path, *, batch_size: int = 128) -> dict[str, Any]:
+def evaluate_gnn(
+    model_path: Path,
+    data_path: Path,
+    metrics_path: Path,
+    *,
+    batch_size: int = 128,
+    threshold: float = 0.5,
+) -> dict[str, Any]:
     data = load_graph_dataset(data_path)
     test_idx = data["test_idx"]
     model = load_gnn_model(str(model_path))
@@ -28,12 +35,13 @@ def evaluate_gnn(model_path: Path, data_path: Path, metrics_path: Path, *, batch
         batch_size=batch_size,
         verbose=0,
     )
-    metrics = binary_classification_metrics(data["y"][test_idx], probs[:, 0])
+    metrics = binary_classification_metrics(data["y"][test_idx], probs[:, 0], threshold=threshold)
 
     config = {
         "model_path": str(model_path),
         "data_path": str(data_path),
         "batch_size": batch_size,
+        "threshold": threshold,
     }
     for key in ("distance", "rounds", "p", "shots", "max_nodes", "k_neighbors"):
         if key in data:
@@ -51,6 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--out", type=Path, default=None)
     return parser.parse_args()
 
@@ -58,7 +67,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     metrics_path = args.out or METRICS_DIR / f"gnn_eval_{args.model.stem}.json"
-    evaluate_gnn(args.model, args.data, metrics_path, batch_size=args.batch_size)
+    evaluate_gnn(args.model, args.data, metrics_path, batch_size=args.batch_size, threshold=args.threshold)
 
 
 if __name__ == "__main__":

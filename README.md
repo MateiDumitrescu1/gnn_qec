@@ -87,3 +87,85 @@ MWPM:
 ```
 
 Conclusion: the baseline works end to end, but the simple GNN is worse than the MWPM control decoder on Run 1. That is expected for this first implementation; the useful result is that the comparison is reproducible and both decoders are evaluated on the same saved test shots.
+
+## Run 2
+
+Run 2 keeps the same Stim physical setup as Run 1 but uses more data and a stronger fixed detector-location graph.
+
+Configuration:
+
+```text
+distance = 3
+rounds = 5
+physical error probability p = 0.02
+shots = 50000
+train/val/test split = 70% / 15% / 15%
+graph type = fixed detector-location graph
+edge type = detector-error-model edges
+model = residual GCN
+threshold = tuned on validation split
+```
+
+Generated data:
+
+```text
+raw data = data/generated/raw_run2_d3_r5_p02_s50000.npz
+graph data = data/generated/graphs_fixed_run2_d3_r5_p02_s50000.npz
+num_detectors = 40
+positive label fraction = 0.374760
+test positive label fraction = 0.367333
+graph truncation rate = 0.000000
+empty graph fraction = 0.000000
+DEM detector-detector edges = 102
+boundary-connected detectors = 40
+```
+
+Run 2 also uses Stim-generated simulated QEC data from `stim.Circuit.generated("surface_code:rotated_memory_z", distance=3, rounds=5, ...)`. The detector samples and logical-flip labels come from Stim's compiled detector sampler with `separate_observables=True`.
+
+Implementation changes from Run 1:
+
+```text
+Run 1 graph = one node per active detector event
+Run 2 graph = one node per possible detector location
+Run 2 node features = detector bit, normalized x, y, t, detector index, DEM degree, boundary count
+Run 2 model = residual GCN with normalization, dropout, mean/max pooling, flattened detector summary, and validation-tuned threshold
+```
+
+Training notes:
+
+```text
+unit tests = 7 passed
+tiny-overfit training accuracy = 0.976562
+tiny-overfit error rate = 0.023438
+full training epochs requested = 40
+full training epochs ran = 33
+validation-tuned threshold = 0.520
+```
+
+During Run 2, the first full training pass was slow and validation accuracy stayed around `0.65`. The data itself was not invalid: MWPM reached `0.760800` on the same 50k-shot dataset, so there is learnable signal. The main issue is that the supervised GNN is trying to learn a decoder from examples, while MWPM gets the exact detector error model as decoding structure.
+
+I also found and fixed a graph-construction issue in the detector-error-model edges. Stim DEM instructions can contain separated target groups such as `D1 D5 ^ D4`; those groups should not be treated as one clique. After respecting DEM target groups, the fixed graph had `102` detector-detector edges instead of the earlier over-connected `182` edges.
+
+Score comparison on the same test split:
+
+```text
+GNN:
+  accuracy = 0.693467
+  logical prediction error = 0.306533
+  balanced accuracy = 0.632461
+  TP = 1109
+  TN = 4092
+  FP = 653
+  FN = 1646
+
+MWPM:
+  accuracy = 0.760800
+  logical prediction error = 0.239200
+  balanced accuracy = 0.737585
+  TP = 1791
+  TN = 3915
+  FP = 830
+  FN = 964
+```
+
+Conclusion: Run 2 improved the GNN from `0.560000` to `0.693467` accuracy, but it still did not beat the MWPM control at `0.760800`. The most likely next step is not changing the Stim data, but improving data efficiency: train on more shots, add distance/round sweeps, include explicit boundary-node structure, or use MWPM/DEM-derived features as additional supervised inputs.

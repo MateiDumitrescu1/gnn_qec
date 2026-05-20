@@ -74,6 +74,10 @@ def load_graph_dataset(path: Path | str) -> dict[str, np.ndarray]:
             "feature_dim",
             "truncation_rate",
             "empty_graph_fraction",
+            "graph_type",
+            "node_features",
+            "dem_edge_count",
+            "boundary_detector_count",
         ):
             if key in data.files:
                 result[key] = np.asarray(data[key])

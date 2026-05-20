@@ -34,8 +34,8 @@ def compare_metrics(gnn_path: Path, mwpm_path: Path, output_path: Path | None = 
         "p": gnn_config.get("p", mwpm_config.get("p")),
         "shots": gnn_config.get("shots", mwpm_config.get("shots")),
         "max_nodes": gnn_config.get("max_nodes"),
-        "graph_type": "active_defect_knn",
-        "node_features": "x,y,t,detector_index_normalized",
+        "graph_type": gnn_config.get("graph_type", "unknown"),
+        "node_features": gnn_config.get("node_features", "unknown"),
     }
     summary = {
         **config,

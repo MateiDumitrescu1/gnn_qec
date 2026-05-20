@@ -1,0 +1,2 @@
+- visualize the graph and the edges, so it's much clearer what the Stim data is and how I create the graph
+- 

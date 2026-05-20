@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+from itertools import combinations
 from pathlib import Path
 
 import numpy as np
+import stim
 
 from qec_gnn.config import DATA_DIR, DEFAULT_CONFIG
 from qec_gnn.dataset import load_split_indices, make_split_indices
@@ -38,6 +40,46 @@ def normalize_adjacency(adj: np.ndarray) -> np.ndarray:
     degree = np.sum(adj, axis=1)
     d_inv_sqrt = np.power(degree + 1e-8, -0.5)
     return (d_inv_sqrt[:, None] * adj * d_inv_sqrt[None, :]).astype(np.float32)
+
+
+def detector_error_model_adjacency(
+    dem: stim.DetectorErrorModel,
+    *,
+    num_detectors: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build detector-detector topology from graphlike DEM error mechanisms.
+
+    Single-detector error mechanisms are treated as boundary connections and
+    recorded as a node feature instead of adding explicit boundary nodes.
+    """
+    adj = np.zeros((num_detectors, num_detectors), dtype=np.float32)
+    edge_weights = np.zeros((num_detectors, num_detectors), dtype=np.float32)
+    boundary_counts = np.zeros((num_detectors,), dtype=np.float32)
+
+    for instruction in dem.flattened():
+        if instruction.type != "error":
+            continue
+
+        probability = float(instruction.args_copy()[0])
+        for target_group in instruction.target_groups():
+            detector_ids = [
+                target.val
+                for target in target_group
+                if target.is_relative_detector_id()
+            ]
+
+            if len(detector_ids) == 1:
+                boundary_counts[detector_ids[0]] += probability
+                continue
+
+            for i, j in combinations(sorted(set(detector_ids)), 2):
+                adj[i, j] = 1.0
+                adj[j, i] = 1.0
+                edge_weights[i, j] += probability
+                edge_weights[j, i] += probability
+
+    degrees = np.sum(adj, axis=1).astype(np.float32)
+    return adj, degrees, boundary_counts
 
 
 def build_graph_from_shot(
@@ -125,18 +167,87 @@ def build_graph_dataset(
     }
 
 
-def build_graph_file(input_path: Path, output_path: Path, *, max_nodes: int, k: int, seed: int) -> Path:
+def build_fixed_detector_dataset(
+    detectors: np.ndarray,
+    labels: np.ndarray,
+    coords: np.ndarray,
+    dem: stim.DetectorErrorModel,
+) -> dict[str, np.ndarray | float | int]:
+    """Build one fixed detector-location graph per shot.
+
+    Nodes are all detector locations. The per-shot detector bit is a node
+    feature, and topology is shared across shots from the detector error model.
+    """
+    num_examples, num_detectors = detectors.shape
+    adjacency, degrees, boundary_counts = detector_error_model_adjacency(
+        dem,
+        num_detectors=num_detectors,
+    )
+    normalized_adjacency = normalize_adjacency(adjacency)
+
+    detector_index = (
+        np.arange(num_detectors, dtype=np.float32)[:, None] / max(num_detectors - 1, 1)
+    )
+    max_degree = max(float(np.max(degrees)), 1.0)
+    max_boundary_count = max(float(np.max(boundary_counts)), 1.0)
+    static_features = np.concatenate(
+        [
+            coords.astype(np.float32),
+            detector_index,
+            (degrees[:, None] / max_degree).astype(np.float32),
+            (boundary_counts[:, None] / max_boundary_count).astype(np.float32),
+        ],
+        axis=1,
+    )
+
+    feature_dim = 1 + static_features.shape[1]
+    x = np.zeros((num_examples, num_detectors, feature_dim), dtype=np.float32)
+    x[:, :, 0] = detectors.astype(np.float32)
+    x[:, :, 1:] = static_features[None, :, :]
+
+    a = np.broadcast_to(
+        normalized_adjacency[None, :, :],
+        (num_examples, num_detectors, num_detectors),
+    ).copy()
+    mask = np.ones((num_examples, num_detectors), dtype=np.float32)
+
+    return {
+        "X": x,
+        "A": a.astype(np.float32),
+        "mask": mask,
+        "y": labels.astype(np.uint8).reshape(-1),
+        "node_counts": np.full((num_examples,), num_detectors, dtype=np.int32),
+        "truncated": np.zeros((num_examples,), dtype=np.uint8),
+        "empty_graphs": np.zeros((num_examples,), dtype=np.uint8),
+        "dem_degrees": degrees.astype(np.float32),
+        "dem_boundary_counts": boundary_counts.astype(np.float32),
+        "feature_dim": feature_dim,
+        "truncation_rate": 0.0,
+        "empty_graph_fraction": 0.0,
+        "dem_edge_count": int(np.sum(adjacency) // 2),
+        "boundary_detector_count": int(np.sum(boundary_counts > 0)),
+    }
+
+
+def build_graph_file(
+    input_path: Path,
+    output_path: Path,
+    *,
+    max_nodes: int,
+    k: int,
+    seed: int,
+    graph_type: str,
+) -> Path:
     with np.load(input_path, allow_pickle=False) as raw:
         detectors = raw["detectors"].astype(np.uint8)
         labels = raw["labels"].astype(np.uint8)
+        distance = int(raw["distance"])
+        rounds = int(raw["rounds"])
+        p = float(raw["p"])
         if "detector_coords" in raw.files:
             coords = raw["detector_coords"].astype(np.float32)
         else:
-            circuit = make_surface_code_circuit(
-                distance=int(raw["distance"]),
-                rounds=int(raw["rounds"]),
-                p=float(raw["p"]),
-            )
+            circuit = make_surface_code_circuit(distance=distance, rounds=rounds, p=p)
             coords = get_detector_coord_array(circuit)
 
         if {"train_idx", "val_idx", "test_idx"}.issubset(raw.files):
@@ -144,7 +255,21 @@ def build_graph_file(input_path: Path, output_path: Path, *, max_nodes: int, k: 
         else:
             train_idx, val_idx, test_idx = make_split_indices(len(labels), seed=seed)
 
-        graph_data = build_graph_dataset(detectors, labels, coords, max_nodes=max_nodes, k=k)
+        if graph_type == "active":
+            graph_data = build_graph_dataset(detectors, labels, coords, max_nodes=max_nodes, k=k)
+            graph_type_name = "active_defect_knn"
+            node_features = "x,y,t,detector_index_normalized"
+            output_max_nodes = max_nodes
+        elif graph_type == "fixed":
+            circuit = make_surface_code_circuit(distance=distance, rounds=rounds, p=p)
+            dem = circuit.detector_error_model(decompose_errors=True)
+            graph_data = build_fixed_detector_dataset(detectors, labels, coords, dem)
+            graph_type_name = "fixed_detector_dem"
+            node_features = "detector_bit,x,y,t,detector_index_normalized,dem_degree,boundary_count"
+            output_max_nodes = detectors.shape[1]
+        else:
+            raise ValueError(f"Unsupported graph_type: {graph_type}")
+
         metadata = {
             key: raw[key]
             for key in ("distance", "rounds", "p", "shots", "seed")
@@ -159,18 +284,22 @@ def build_graph_file(input_path: Path, output_path: Path, *, max_nodes: int, k: 
         train_idx=train_idx,
         val_idx=val_idx,
         test_idx=test_idx,
-        max_nodes=np.array(max_nodes, dtype=np.int64),
+        max_nodes=np.array(output_max_nodes, dtype=np.int64),
         k_neighbors=np.array(k, dtype=np.int64),
-        graph_type=np.array("active_defect_knn"),
-        node_features=np.array("x,y,t,detector_index_normalized"),
+        graph_type=np.array(graph_type_name),
+        node_features=np.array(node_features),
     )
 
     print("Graphs:")
     print(f"  input = {input_path}")
     print(f"  output = {output_path}")
     print(f"  examples = {len(labels)}")
-    print(f"  max_nodes = {max_nodes}")
+    print(f"  graph_type = {graph_type_name}")
+    print(f"  max_nodes = {output_max_nodes}")
     print(f"  k_neighbors = {k}")
+    if graph_type == "fixed":
+        print(f"  dem_edge_count = {graph_data['dem_edge_count']}")
+        print(f"  boundary_detector_count = {graph_data['boundary_detector_count']}")
     print(f"  truncation_rate = {graph_data['truncation_rate']:.6f}")
     print(f"  empty_graph_fraction = {graph_data['empty_graph_fraction']:.6f}")
     return output_path
@@ -182,6 +311,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--max-nodes", type=int, default=cfg.max_nodes)
     parser.add_argument("--k", type=int, default=cfg.k_neighbors)
+    parser.add_argument("--graph-type", choices=("active", "fixed"), default="active")
     parser.add_argument("--seed", type=int, default=cfg.seed)
     parser.add_argument("--out", type=Path, default=None)
     return parser.parse_args()
@@ -196,7 +326,14 @@ def main() -> None:
             int(raw["rounds"]),
             float(raw["p"]),
         )
-    build_graph_file(args.input, output_path, max_nodes=args.max_nodes, k=args.k, seed=args.seed)
+    build_graph_file(
+        args.input,
+        output_path,
+        max_nodes=args.max_nodes,
+        k=args.k,
+        seed=args.seed,
+        graph_type=args.graph_type,
+    )
 
 
 if __name__ == "__main__":

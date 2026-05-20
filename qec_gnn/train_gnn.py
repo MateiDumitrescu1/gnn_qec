@@ -11,7 +11,7 @@ import tensorflow as tf
 
 from qec_gnn.config import DEFAULT_CONFIG, METRICS_DIR, MODEL_DIR
 from qec_gnn.dataset import load_graph_dataset
-from qec_gnn.model import build_gnn_model
+from qec_gnn.model import build_decoder_model
 from qec_gnn.utils import binary_classification_metrics, print_metric_block, save_json
 
 
@@ -41,6 +41,23 @@ def _class_weight(y: np.ndarray) -> dict[int, float] | None:
     return {0: total / (2.0 * counts[0]), 1: total / (2.0 * counts[1])}
 
 
+def choose_threshold(y_true: np.ndarray, probabilities: np.ndarray) -> tuple[float, float]:
+    """Choose the validation threshold with the best accuracy."""
+    y_true = y_true.astype(np.uint8).reshape(-1)
+    probabilities = probabilities.reshape(-1)
+    best_threshold = 0.5
+    best_accuracy = -1.0
+
+    for threshold in np.linspace(0.05, 0.95, 181):
+        predictions = (probabilities >= threshold).astype(np.uint8)
+        accuracy = float(np.mean(predictions == y_true))
+        if accuracy > best_accuracy:
+            best_accuracy = accuracy
+            best_threshold = float(threshold)
+
+    return best_threshold, best_accuracy
+
+
 def train_gnn(
     data_path: Path,
     *,
@@ -51,6 +68,9 @@ def train_gnn(
     hidden_dim: int,
     learning_rate: float,
     dropout: float,
+    model_type: str,
+    class_weight_mode: str,
+    patience: int,
     tiny_overfit: bool,
     tiny_examples: int,
     seed: int,
@@ -78,7 +98,8 @@ def train_gnn(
         val_idx = data["val_idx"]
         test_idx = data["test_idx"]
 
-    model = build_gnn_model(
+    model = build_decoder_model(
+        model_type=model_type,
         max_nodes=max_nodes,
         feature_dim=feature_dim,
         hidden_dim=hidden_dim,
@@ -91,7 +112,7 @@ def train_gnn(
         callbacks.append(
             tf.keras.callbacks.EarlyStopping(
                 monitor="val_loss",
-                patience=5,
+                patience=patience,
                 restore_best_weights=True,
             )
         )
@@ -106,13 +127,16 @@ def train_gnn(
         batch_size=batch_size,
         verbose=2,
         callbacks=callbacks,
-        class_weight=None if tiny_overfit else _class_weight(y[train_idx]),
+        class_weight=_class_weight(y[train_idx]) if class_weight_mode == "balanced" and not tiny_overfit else None,
     )
 
     train_prob = model.predict([x[train_idx], a[train_idx], mask[train_idx]], batch_size=batch_size, verbose=0)
+    val_prob = model.predict([x[val_idx], a[val_idx], mask[val_idx]], batch_size=batch_size, verbose=0)
     test_prob = model.predict([x[test_idx], a[test_idx], mask[test_idx]], batch_size=batch_size, verbose=0)
-    train_metrics = binary_classification_metrics(y[train_idx], train_prob[:, 0])
-    test_metrics = binary_classification_metrics(y[test_idx], test_prob[:, 0])
+    threshold, val_accuracy_at_threshold = choose_threshold(y[val_idx], val_prob[:, 0])
+    train_metrics = binary_classification_metrics(y[train_idx], train_prob[:, 0], threshold=threshold)
+    val_metrics = binary_classification_metrics(y[val_idx], val_prob[:, 0], threshold=threshold)
+    test_metrics = binary_classification_metrics(y[test_idx], test_prob[:, 0], threshold=threshold)
 
     if output_path is not None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -128,6 +152,11 @@ def train_gnn(
         "hidden_dim": hidden_dim,
         "learning_rate": learning_rate,
         "dropout": dropout,
+        "model_type": model_type,
+        "class_weight_mode": class_weight_mode,
+        "early_stopping_patience": patience,
+        "threshold": threshold,
+        "val_accuracy_at_threshold": val_accuracy_at_threshold,
         "max_nodes": max_nodes,
         "feature_dim": feature_dim,
         "seed": seed,
@@ -140,6 +169,10 @@ def train_gnn(
         "k_neighbors",
         "truncation_rate",
         "empty_graph_fraction",
+        "graph_type",
+        "node_features",
+        "dem_edge_count",
+        "boundary_detector_count",
     ):
         if key in data:
             config[key] = _scalar(data[key])
@@ -148,13 +181,16 @@ def train_gnn(
         "kind": "gnn",
         "config": config,
         "train": train_metrics,
+        "val": val_metrics,
         "test": test_metrics,
         "history": {key: [float(v) for v in values] for key, values in history.history.items()},
     }
     save_json(metrics_path, payload)
 
     print_metric_block("GNN train", train_metrics)
+    print_metric_block("GNN val", val_metrics)
     print_metric_block("GNN test", test_metrics)
+    print(f"threshold = {threshold:.3f}")
     print(f"metrics = {metrics_path}")
     if output_path is not None:
         print(f"model = {output_path}")
@@ -170,6 +206,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=cfg.hidden_dim)
     parser.add_argument("--learning-rate", type=float, default=cfg.learning_rate)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--model-type", choices=("gcn", "residual_gcn"), default="gcn")
+    parser.add_argument("--class-weight-mode", choices=("balanced", "none"), default="balanced")
+    parser.add_argument("--patience", type=int, default=5)
     parser.add_argument("--seed", type=int, default=cfg.seed)
     parser.add_argument("--tiny-overfit", action="store_true")
     parser.add_argument("--tiny-examples", type=int, default=128)
@@ -194,6 +233,9 @@ def main() -> None:
         hidden_dim=args.hidden_dim,
         learning_rate=args.learning_rate,
         dropout=args.dropout,
+        model_type=args.model_type,
+        class_weight_mode=args.class_weight_mode,
+        patience=args.patience,
         tiny_overfit=args.tiny_overfit,
         tiny_examples=args.tiny_examples,
         seed=args.seed,
